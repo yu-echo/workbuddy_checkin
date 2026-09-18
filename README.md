@@ -171,6 +171,12 @@ WorkBuddy 的签到接口没有公开文档，下面这些端点是**实测出�
 - 签到接口的端点与请求头来自对客户端网络请求的实测抓取
 - 推送通道使用 **[PushPlus](https://www.pushplus.plus/)**
 
+---
+
+## License
+
+[MIT](./LICENSE)
+
 <p align="center">
   <sub>Made with ❤️ for personal automation</sub>
 </p>
