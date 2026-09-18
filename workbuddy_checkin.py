@@ -1,165 +1,240 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WorkBuddy 自动签到脚本 v2.0
-改进点：
-1. Token 自动刷新：读取 refreshToken，过期时自动续期，无需手动更新 Secret
-2. 双接口兼容：同时尝试 /v2/ 和新版接口，提高健壮性
-3. 完善推送：成功/失败/已签到 三种状态均推送微信通知
-4. 幂等保证：先查状态再签到，重复运行不会多领
-5. 配置分离：所有敏感信息通过环境变量注入，脚本本身零密钥
+WorkBuddy 自动签到脚本 v3.0
+
+与 v2.0 的区别（v2.0 的接口和调用方式均为猜测，实测全部失效）：
+  1. 刷新接口修正为 POST /v2/plugin/auth/token/refresh，用 X-Refresh-Token 头传令牌
+     （v2.0 用的 /v2/auth/refresh-token 是 404）
+  2. 凭证 WORKBUDDY_REFRESH_TOKEN 按 `手机号:accessToken:refreshToken` 解析，
+     不再把整串塞进 Authorization（v2.0 因此必然 401）
+  3. 签到接口改为 POST，并补上必需的 X-User-Id / X-Domain 头
+     （v2.0 用 GET，必然 404）
+  4. 成功判据改为业务码 code == 0（v2.0 判断的 code==10001 并不存在）
+  5. 已签到字段为 today_checked_in（v2.0 查的 data.checked 不存在）
+  6. 新增令牌到期预警：refreshToken 剩余不足 7 天时推送提醒
+
+所有敏感信息通过环境变量注入，脚本本身零密钥。
 """
 
+import base64
 import json
 import os
 import sys
-import time
-import urllib.request
 import urllib.error
+import urllib.request
 from datetime import datetime
 
 # ==================== 配置区域 ====================
-# 通过环境变量注入，GitHub Actions 中配置为 Secrets
-REFRESH_TOKEN = os.environ.get("WORKBUDDY_REFRESH_TOKEN", "")
-PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "")  # 可选，失败时推送
 
-# WorkBuddy 接口地址（实测有效）
-BASE_URL = "https://www.codebuddy.cn"
+CREDENTIAL = os.environ.get("WORKBUDDY_REFRESH_TOKEN", "").strip()
+PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "").strip()
+
+BASE_URL = os.environ.get("WORKBUDDY_BASE_URL", "https://www.workbuddy.cn").rstrip("/")
+REFRESH_URL = f"{BASE_URL}/v2/plugin/auth/token/refresh"
 STATUS_URL = f"{BASE_URL}/v2/billing/meter/checkin-activity-status"
 CHECKIN_URL = f"{BASE_URL}/v2/billing/meter/daily-checkin"
-REFRESH_URL = f"{BASE_URL}/v2/auth/refresh-token"  # 推测的刷新接口
+
+DEFAULT_DOMAIN = "www.workbuddy.cn"
+TOKEN_WARN_DAYS = 7
+TIMEOUT = 20
 
 # ==================== 工具函数 ====================
 
-def http_request(url, method="GET", headers=None, data=None, timeout=15):
-    """通用 HTTP 请求函数"""
-    if headers is None:
-        headers = {}
-    req = urllib.request.Request(url, method=method, headers=headers)
-    if data is not None:
-        req.data = json.dumps(data).encode("utf-8")
-        req.add_header("Content-Type", "application/json")
+
+def jwt_claim(token, key):
+    """从 JWT 中读取指定 claim（不做签名校验，仅用于取 uid / exp）。"""
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8")), resp.status
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload)).get(key)
+    except Exception:
+        return None
+
+
+def http_json(url, method="GET", headers=None, body=None):
+    """返回 (json_or_text, status)。从不抛异常。"""
+    data = None
+    hdrs = dict(headers or {})
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        hdrs["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, method=method, headers=hdrs, data=data)
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8", "ignore")
+            try:
+                return json.loads(raw), resp.status
+            except json.JSONDecodeError:
+                return raw, resp.status
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="ignore")
+        raw = e.read().decode("utf-8", "ignore")
         try:
-            return json.loads(body), e.code
+            return json.loads(raw), e.code
         except json.JSONDecodeError:
-            return {"error": body}, e.code
+            return raw, e.code
     except Exception as e:
-        return {"error": str(e)}, 0
+        return f"<{type(e).__name__}: {e}>", 0
+
 
 def push_notify(title, content):
-    """通过 PushPlus 推送微信通知（可选）"""
+    """PushPlus 微信推送（未配置则只打印）。"""
+    print(f"[通知] {title} | {content}")
     if not PUSHPLUS_TOKEN:
-        print(f"[通知跳过] {title}: {content}")
         return
-    payload = {
-        "token": PUSHPLUS_TOKEN,
-        "title": title,
-        "content": content,
-        "template": "txt"
-    }
-    result, status = http_request(
-        "https://www.pushplus.plus/send",
-        method="POST",
-        data=payload
-    )
-    if status == 200 and result.get("code") == 200:
-        print(f"[通知成功] {title}")
-    else:
-        print(f"[通知失败] {result}")
+    result, status = http_json("https://www.pushplus.plus/send", method="POST",
+                               body={"token": PUSHPLUS_TOKEN, "title": title,
+                                     "content": content, "template": "txt"})
+    ok = status == 200 and isinstance(result, dict) and result.get("code") == 200
+    print(f"[推送{'成功' if ok else '失败'}] {result if not ok else title}")
 
-def refresh_access_token(refresh_token):
-    """
-    使用 refreshToken 换取新的 accessToken
-    改进点：这是现有方案中缺失的关键环节
-    """
-    payload = {
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token
-    }
-    result, status = http_request(REFRESH_URL, method="POST", data=payload)
-    if status == 200 and "accessToken" in result:
-        print("[Token刷新] 成功获取新的 accessToken")
-        return result.get("accessToken"), result.get("refreshToken", refresh_token)
-    else:
-        print(f"[Token刷新] 失败: {result}")
-        return None, refresh_token
+
+def die(title, message):
+    push_notify(title, message)
+    sys.exit(1)
+
 
 # ==================== 主流程 ====================
+
+def parse_credential(raw):
+    """解析 `手机号:accessToken:refreshToken`；也兼容直接粘贴单个 token。"""
+    parts = [p.strip() for p in raw.split(":")]
+    if len(parts) == 3:
+        return parts[0], parts[1], parts[2]
+    if len(parts) == 1:
+        return (jwt_claim(parts[0], "preferred_username") or ""), parts[0], ""
+    raise ValueError("凭证格式应为 手机号:accessToken:refreshToken")
+
+
+def refresh_access_token(refresh_token, domain):
+    """用 refreshToken 换新的 accessToken / refreshToken。失败返回 (None, None, domain)。"""
+    headers = {
+        "Accept": "application/json",
+        "X-Refresh-Token": refresh_token,
+        "X-Auth-Refresh-Source": "plugin",
+        "X-Domain": domain,
+    }
+    uid = jwt_claim(refresh_token, "sub")
+    if uid:
+        headers["X-User-Id"] = uid
+
+    result, status = http_json(REFRESH_URL, method="POST", headers=headers, body={})
+    if status == 200 and isinstance(result, dict) and result.get("code") == 0:
+        data = result.get("data") or {}
+        at = data.get("accessToken")
+        if at:
+            print("[Token刷新] 成功获取新的 accessToken")
+            return at, data.get("refreshToken") or refresh_token, data.get("domain") or domain
+    print(f"[Token刷新] 失败: status={status} resp={result}")
+    return None, None, domain
+
+
+def check_token_lifetime(refresh_token):
+    """检查 refreshToken 剩余有效期，临近到期时提醒。"""
+    exp = jwt_claim(refresh_token, "exp")
+    if not exp:
+        return
+    left = int(exp - datetime.now().timestamp())
+    days = left // 86400
+    if left <= 0:
+        print(f"[令牌] refreshToken 已过期 {-days} 天")
+    elif days < TOKEN_WARN_DAYS:
+        push_notify(
+            "⚠️ WorkBuddy 凭证即将过期",
+            f"refreshToken 仅剩 {days} 天有效期。请双击桌面「获取凭证.bat」，"
+            f"把新的 手机号:AT:RT 更新到 GitHub Secret WORKBUDDY_REFRESH_TOKEN。")
+    else:
+        print(f"[令牌] refreshToken 剩余 {days} 天")
+
 
 def main():
     print(f"=== WorkBuddy 自动签到 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
 
-    if not REFRESH_TOKEN:
-        msg = "未配置 WORKBUDDY_REFRESH_TOKEN，请在 GitHub Secrets 中添加"
-        print(f"[错误] {msg}")
-        push_notify("❌ WorkBuddy 签到失败", msg)
+    if not CREDENTIAL:
+        die("❌ WorkBuddy 签到失败",
+            "未配置 WORKBUDDY_REFRESH_TOKEN，请在 GitHub Secrets 中添加。")
+
+    try:
+        phone, access_token, refresh_token = parse_credential(CREDENTIAL)
+    except ValueError as e:
+        print(f"[错误] {e}")
         sys.exit(1)
 
-    # 步骤 1：尝试用 refreshToken 换取 accessToken
-    access_token, new_refresh = refresh_access_token(REFRESH_TOKEN)
+    print(f"[凭证] 手机号={phone or '未知'} accessToken={len(access_token)} 字符 "
+          f"refreshToken={len(refresh_token)} 字符")
 
-    # 如果刷新失败，尝试将 REFRESH_TOKEN 本身当作 accessToken 使用
-    # （兼容首次配置时直接填入 accessToken 的情况）
-    if not access_token:
-        access_token = REFRESH_TOKEN
-        print("[Token刷新] 跳过，直接使用提供的 Token 作为 accessToken")
+    domain = DEFAULT_DOMAIN
+
+    # 步骤 1：刷新 accessToken
+    if refresh_token:
+        new_at, new_rt, domain = refresh_access_token(refresh_token, domain)
+        if new_at:
+            access_token = new_at
+        else:
+            print("[Token刷新] 回退使用凭证中的 accessToken")
+            check_token_lifetime(refresh_token)
 
     headers = {
+        "Accept": "application/json",
         "Authorization": f"Bearer {access_token}",
-        "User-Agent": "WorkBuddy-Desktop/1.0",
-        "Accept": "application/json"
+        "X-Domain": domain,
     }
+    uid = jwt_claim(access_token, "sub")
+    if uid:
+        headers["X-User-Id"] = uid
 
     # 步骤 2：查询今日签到状态（幂等检查）
-    status_data, status_code = http_request(STATUS_URL, headers=headers)
+    status_data, status_code = http_json(STATUS_URL, method="POST", headers=headers, body={})
 
-    if status_code == 401 or status_code == 403:
-        msg = "登录态已过期，Token 可能失效。请重新获取 refreshToken 并更新 GitHub Secret。"
-        print(f"[失败] {msg}")
-        push_notify("⚠️ WorkBuddy 签到需要更新 Token", msg)
-        sys.exit(1)
+    if status_code in (401, 403):
+        die("⚠️ WorkBuddy 登录态失效",
+            "accessToken 已失效且无法自动刷新。请双击桌面「获取凭证.bat」，"
+            "把新的 手机号:AT:RT 更新到 GitHub Secret WORKBUDDY_REFRESH_TOKEN。")
 
-    # 解析已签到状态
-    already_checked = False
-    if isinstance(status_data, dict):
-        # 兼容多种返回结构
-        if status_data.get("code") == 10001:
-            already_checked = True
-        elif status_data.get("data", {}).get("checked") is True:
-            already_checked = True
-        elif "已签到" in str(status_data.get("message", "")):
-            already_checked = True
+    if not isinstance(status_data, dict) or status_data.get("code") != 0:
+        detail = status_data if isinstance(status_data, str) else json.dumps(
+            status_data, ensure_ascii=False)
+        die("❌ WorkBuddy 签到失败", f"查询签到状态异常：HTTP {status_code} {detail[:300]}")
 
-    if already_checked:
-        msg = "今日已签到，无需重复操作"
+    info = status_data.get("data") or {}
+    print(f"[状态] 活动={info.get('theme_name') or info.get('activity_name')} "
+          f"连续={info.get('streak_days')}天 累计={info.get('total_credits')}积分")
+
+    if info.get("today_checked_in"):
+        msg = (f"今日已签到，连续 {info.get('streak_days', '?')} 天，"
+               f"累计 {info.get('total_credits', '?')} 积分")
         print(f"[跳过] {msg}")
         push_notify("✅ WorkBuddy 今日已签到", msg)
         return
 
     # 步骤 3：执行签到
-    checkin_data, checkin_code = http_request(CHECKIN_URL, method="POST", headers=headers)
+    checkin_data, checkin_code = http_json(CHECKIN_URL, method="POST", headers=headers, body={})
 
-    if checkin_code == 200:
-        if checkin_data.get("code") == 10001:
-            msg = "接口返回已签到，今日签到状态确认"
-            print(f"[已签到] {msg}")
-            push_notify("✅ WorkBuddy 今日已签到", msg)
-        else:
-            points = checkin_data.get("data", {}).get("points", "未知")
-            streak = checkin_data.get("data", {}).get("streak", "未知")
-            msg = f"签到成功！获得 {points} 积分，连续签到 {streak} 天"
-            print(f"[成功] {msg}")
-            push_notify("🎉 WorkBuddy 签到成功", msg)
-    else:
-        msg = f"签到接口返回异常: code={checkin_code}, data={checkin_data}"
-        print(f"[失败] {msg}")
-        push_notify("❌ WorkBuddy 签到失败", msg)
-        sys.exit(1)
+    if not isinstance(checkin_data, dict):
+        die("❌ WorkBuddy 签到失败",
+            f"签到接口返回异常：HTTP {checkin_code} {str(checkin_data)[:300]}")
+
+    bcode = checkin_data.get("code")
+    if bcode == 0:
+        payload = checkin_data.get("data") or checkin_data
+        credit = payload.get("credit", payload.get("today_credit", "?"))
+        streak = payload.get("streak_days", "?")
+        total = payload.get("total_credits", info.get("total_credits", "?"))
+        bonus = "（连签奖励日）" if payload.get("is_streak_day") else ""
+        msg = f"签到成功{bonus}！本次获得 {credit} 积分，连续签到 {streak} 天，累计 {total} 积分"
+        print(f"[成功] {msg}")
+        push_notify("🎉 WorkBuddy 签到成功", msg)
+        return
+
+    msg = checkin_data.get("msg") or "未知错误"
+    if "已" in str(msg) or bcode in (10001, 40001):
+        print(f"[已签到] {msg}")
+        push_notify("✅ WorkBuddy 今日已签到", msg)
+        return
+
+    die("❌ WorkBuddy 签到失败",
+        f"签到接口返回异常：HTTP {checkin_code} code={bcode} msg={msg}")
+
 
 if __name__ == "__main__":
     main()
