@@ -53,6 +53,38 @@ def jwt_claim(token, key):
         return None
 
 
+def mask_phone(phone: str) -> str:
+    """手机号脱敏。
+
+    Actions 日志在公开仓库里是任何登录用户都能看的（未登录看不到），
+    所以完整手机号不能进日志。
+    """
+    if not phone:
+        return "未知"
+    if len(phone) < 7:
+        return "*" * len(phone)
+    return f"{phone[:3]}****{phone[-4:]}"
+
+
+# 响应体里出现这些字段一律替换掉，避免原样打进日志
+_SENSITIVE_KEYS = {
+    "accesstoken", "refreshtoken", "token", "cred", "authorization",
+    "password", "secret", "sessionstate",
+}
+
+
+def sanitize_payload(value):
+    """递归脱敏响应体。日志里不要出现任何令牌字段。"""
+    if isinstance(value, dict):
+        return {
+            k: ("<已脱敏>" if str(k).lower() in _SENSITIVE_KEYS else sanitize_payload(v))
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [sanitize_payload(v) for v in value]
+    return value
+
+
 def http_json(url, method="GET", headers=None, body=None):
     """返回 (json_or_text, status)。从不抛异常。"""
     data = None
@@ -155,7 +187,7 @@ def refresh_access_token(refresh_token, domain):
         if at:
             print("[Token刷新] 成功获取新的 accessToken")
             return at, data.get("refreshToken") or refresh_token, data.get("domain") or domain
-    print(f"[Token刷新] 失败: status={status} resp={result}")
+    print(f"[Token刷新] 失败: status={status} resp={sanitize_payload(result)}")
     return None, None, domain
 
 
@@ -194,7 +226,7 @@ def main():
     # 刷新会签发新令牌并改写 iat/exp，但 auth_time 保持不变。
     _CTX["access_token"], _CTX["refresh_token"] = access_token, refresh_token
 
-    print(f"[凭证] 手机号={phone or '未知'} accessToken={len(access_token)} 字符 "
+    print(f"[凭证] 手机号={mask_phone(phone)} accessToken={len(access_token)} 字符 "
           f"refreshToken={len(refresh_token)} 字符")
 
     domain = DEFAULT_DOMAIN
