@@ -15,6 +15,7 @@ WorkBuddy 自动签到脚本 v3.0
   6. 新增令牌到期预警：refreshToken 剩余不足 7 天时推送提醒
 
 所有敏感信息通过环境变量注入，脚本本身零密钥。
+仓库：https://github.com/yu-echo/workbuddy_checkin
 """
 
 import base64
@@ -77,14 +78,43 @@ def http_json(url, method="GET", headers=None, body=None):
         return f"<{type(e).__name__}: {e}>", 0
 
 
+# 运行上下文，用于给推送内容附加「来源」与「凭证」信息
+_CTX = {"access_token": "", "refresh_token": ""}
+
+
+def build_footer():
+    """推送尾部：来源 + Token 认证日期 + 凭证有效期。"""
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        source = f"GitHub Actions{(' · ' + os.environ['GITHUB_WORKFLOW']) if os.environ.get('GITHUB_WORKFLOW') else ''}"
+        source += f"\n运行记录：{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/" \
+                  f"{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}"
+    else:
+        source = "本地运行"
+
+    lines = [f"来源：{source}"]
+
+    auth_time = (jwt_claim(_CTX["refresh_token"], "auth_time")
+                 or jwt_claim(_CTX["access_token"], "auth_time"))
+    if auth_time:
+        lines.append(f"Token 认证日期：{datetime.fromtimestamp(auth_time).strftime('%Y-%m-%d')}")
+
+    rt_exp = jwt_claim(_CTX["refresh_token"], "exp")
+    if rt_exp:
+        days = int((rt_exp - datetime.now().timestamp()) // 86400)
+        lines.append(f"凭证有效期至 {datetime.fromtimestamp(rt_exp).strftime('%Y-%m-%d')}（剩 {days} 天）")
+
+    return "\n".join(lines)
+
+
 def push_notify(title, content):
-    """PushPlus 微信推送（未配置则只打印）。"""
+    """PushPlus 微信推送（未配置则只打印）。自动附加来源与凭证信息。"""
+    body = f"{content}\n\n{'-' * 22}\n{build_footer()}"
     print(f"[通知] {title} | {content}")
     if not PUSHPLUS_TOKEN:
         return
     result, status = http_json("https://www.pushplus.plus/send", method="POST",
                                body={"token": PUSHPLUS_TOKEN, "title": title,
-                                     "content": content, "template": "txt"})
+                                     "content": body, "template": "txt"})
     ok = status == 200 and isinstance(result, dict) and result.get("code") == 200
     print(f"[推送{'成功' if ok else '失败'}] {result if not ok else title}")
 
@@ -160,6 +190,10 @@ def main():
         print(f"[错误] {e}")
         sys.exit(1)
 
+    # 认证日期与凭证有效期以「原始凭证」为准：
+    # 刷新会签发新令牌并改写 iat/exp，但 auth_time 保持不变。
+    _CTX["access_token"], _CTX["refresh_token"] = access_token, refresh_token
+
     print(f"[凭证] 手机号={phone or '未知'} accessToken={len(access_token)} 字符 "
           f"refreshToken={len(refresh_token)} 字符")
 
@@ -170,6 +204,7 @@ def main():
         new_at, new_rt, domain = refresh_access_token(refresh_token, domain)
         if new_at:
             access_token = new_at
+            _CTX["access_token"] = new_at
         else:
             print("[Token刷新] 回退使用凭证中的 accessToken")
             check_token_lifetime(refresh_token)
