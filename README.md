@@ -31,7 +31,8 @@
 ### 📱 结果推送
 
 - ✅ 签到成功 → 推送本次获得积分、连续天数、累计积分
-- 😴 今日已签到 → 推送「已签到」，不报错
+- 🔕 **每天最多一条通知** —— 定时任务一天跑 3 次是为了防漏，但只有**真正签到成功**的那次会推送；
+  「今日已签到」只写日志、不推送，不会重复打扰
 - ⚠️ 登录态失效 / 凭证即将过期 → 主动提醒该重新取凭证了
 
 ### 🛡️ 安全
@@ -68,10 +69,38 @@ Token 认证日期：2026-09-17
 
 ## 使用说明
 
-### 1. 拿到凭证
+> ### ⚠️ 先读这段：本仓库不含凭据，也不能共用凭据
+>
+> 这是一个**可公开分享的模板**。仓库里**没有任何人的账号凭据**，而且 GitHub 的 Secret
+> **不会随 fork / 下载一起传递**。
+>
+> - 每个使用者都**必须用自己的 WorkBuddy 账号**配置一次 Secret
+> - fork 之后直接运行**一定会失败** —— 工作流会检测到并打印配置指引（见下方第 2 步）
+> - 拿别人的凭据没有意义：那只能签到别人的账号
+>
+> 下面三步做完就能跑，全程大约 2 分钟。
 
-双击桌面 `获取凭证.bat`，它读取本机 WorkBuddy 的登录态，
-把 `手机号:accessToken:refreshToken` 复制到剪贴板。
+### 1. 拿到凭证（在你自己已登录 WorkBuddy 的电脑上）
+
+**方式 A：一行命令（推荐）**
+
+打开 PowerShell，粘贴执行：
+
+```powershell
+irm https://raw.githubusercontent.com/yu-echo/workbuddy_checkin/main/fetch-credential.ps1 | iex
+```
+
+**方式 B：双击运行**
+
+下载本仓库的 `获取凭证.bat`，双击即可（Windows）。
+
+两种方式都会读取本机 WorkBuddy 的登录态，把 `手机号:accessToken:refreshToken`
+复制到剪贴板，并显示**脱敏**手机号、令牌长度与凭证剩余有效期 ——
+不会把明文凭据打印到屏幕上。
+
+> 目前仅提供 Windows 脚本。macOS / Linux 用户可以照 `fetch-credential.ps1`
+> 的逻辑，读取 `CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info`
+> 里的 `account.phoneNumber` / `auth.accessToken` / `auth.refreshToken` 三个字段自行拼装。
 
 ### 2. 配置 Secrets
 
@@ -95,7 +124,8 @@ cron: '0 0,4,15 * * *'    # UTC
 ```
 
 即北京时间 **08:00 / 12:00 / 23:00**，每天三次。跑三次是为了防漏，
-重复领取由脚本的幂等检查挡住。
+重复领取由脚本的幂等检查挡住；**通知只在真正签到成功的那次发出**，
+所以一天最多收到一条微信消息。
 
 > 工作流里还有个「保活提交」步骤：GitHub 会在仓库 60 天无活动时停用定时任务，
 > 所以每 45 天自动提交一次空文件。这需要写权限，已在 yml 里声明 `permissions: contents: write`。
@@ -140,8 +170,12 @@ WorkBuddy 的签到接口没有公开文档，下面这些端点是**实测出�
 
 ### 凭证过期怎么办
 
-`refreshToken` 有效期约 60 天。剩余不足 7 天时脚本会推送提醒，
-收到后重跑一次 `获取凭证.bat` 并更新 `WORKBUDDY_REFRESH_TOKEN` 即可。
+`refreshToken` 有效期约 60 天。运行 `获取凭证` 脚本时会直接显示**到期日与剩余天数**，
+剩余不足 7 天时签到脚本也会推送提醒。收到提醒后重新取一次，再更新
+`WORKBUDDY_REFRESH_TOKEN` 即可：
+
+- 一行命令：`irm https://raw.githubusercontent.com/yu-echo/workbuddy_checkin/main/fetch-credential.ps1 | iex`
+- 或双击 `获取凭证.bat`
 
 ### 日志怎么看
 

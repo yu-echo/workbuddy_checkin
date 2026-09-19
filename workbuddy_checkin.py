@@ -271,7 +271,8 @@ def main():
         msg = (f"今日已签到，连续 {info.get('streak_days', '?')} 天，"
                f"累计 {info.get('total_credits', '?')} 积分")
         print(f"[跳过] {msg}")
-        push_notify("✅ WorkBuddy 今日已签到", msg)
+        # 不推送：定时任务一天跑 3 次，只有真正签到时才通知，
+        # 否则早上签完，中午和晚上还会各收到一条「今日已签到」，属于重复打扰。
         return
 
     # 步骤 3：执行签到
@@ -296,7 +297,7 @@ def main():
     msg = checkin_data.get("msg") or "未知错误"
     if "已" in str(msg) or bcode in (10001, 40001):
         print(f"[已签到] {msg}")
-        push_notify("✅ WorkBuddy 今日已签到", msg)
+        # 同上：已签到不推送，保证一天最多一条通知
         return
 
     die("❌ WorkBuddy 签到失败",

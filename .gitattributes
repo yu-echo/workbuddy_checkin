@@ -1,0 +1,7 @@
+# 换行符策略：Windows 脚本必须保持 CRLF，
+# 否则别人从网页下载 raw 文件后双击可能行为异常。
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# 其余按平台默认
+* text=auto

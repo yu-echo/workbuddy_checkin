@@ -18,6 +18,43 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
+      # 本仓库是可公开分享的模板：不含、也无法携带任何人的账号凭据。
+      # GitHub Secret 不会随 fork / 下载传递，所以每个使用者都必须自己配一次。
+      - name: 检查凭证是否已配置
+        env:
+          CRED: ${{ secrets.WORKBUDDY_REFRESH_TOKEN }}
+        run: |
+          if [ -z "$CRED" ]; then
+            echo "::error title=尚未配置签到凭证::本仓库不含账号凭据，需你用自己的 WorkBuddy 账号配置一次。"
+            echo ""
+            echo "============================================================"
+            echo "  未检测到 Secret: WORKBUDDY_REFRESH_TOKEN"
+            echo "============================================================"
+            echo ""
+            echo "本仓库是公开模板，不含任何人的账号凭据；GitHub 的 Secret"
+            echo "也不会随 fork / 下载一起传递，所以每个人都要自己配一次。"
+            echo ""
+            echo "配置步骤："
+            echo ""
+            echo "  1) 在已登录 WorkBuddy 的电脑上打开 PowerShell，粘贴执行："
+            echo "     irm https://raw.githubusercontent.com/yu-echo/workbuddy_checkin/main/fetch-credential.ps1 | iex"
+            echo "     （Windows 也可以直接双击仓库里的「获取凭证.bat」）"
+            echo "     执行成功后，凭证会自动复制到剪贴板。"
+            echo ""
+            echo "  2) 打开本仓库 Settings -> Secrets and variables -> Actions"
+            echo "     点 New repository secret"
+            echo "     Name 填 WORKBUDDY_REFRESH_TOKEN"
+            echo "     Secret 粘贴上一步复制的内容"
+            echo ""
+            echo "  3) 回到 Actions 页面重新运行本工作流"
+            echo ""
+            echo "详细说明见 README 的「使用说明」章节。"
+            echo "提示：凭证是账号登录态，约 60 天过期，届时重新取一次即可。"
+            echo "============================================================"
+            exit 1
+          fi
+          echo "凭证已配置，继续执行签到。"
+
       - name: 设置 Python
         uses: actions/setup-python@v5
         with:
