@@ -3,8 +3,8 @@ name: WorkBuddy 自动签到
 
 on:
   schedule:
-    # 北京时间 08:00, 12:00, 23:00 各执行一次
-    - cron: '0 0,4,15 * * *'
+    # 北京时间 07:00，每天一次（GitHub cron 用 UTC，北京时间 = UTC+8）
+    - cron: '0 23 * * *'
   workflow_dispatch:  # 支持手动触发
 
 # 保活提交需要写权限（否则 git push 会 403）
